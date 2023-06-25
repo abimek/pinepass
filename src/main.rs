@@ -1,8 +1,9 @@
-use std::{env, path::Path, sync::Arc, process, fs::{self, File}, collections::BTreeMap, io::{BufReader, BufRead, Read}};
+use std::{env, path::Path, sync::Arc, process, fs::{self, File}, collections::BTreeMap, io::{BufReader, BufRead, Read, Write}};
 
 /// pinepass fill 
 
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle, ProgressState};
 use tokio::sync::Mutex;
 use walkdir::{WalkDir, DirEntry};
 use pinenut::{models::{Vector, MappedValue}, Client, Index};
@@ -109,7 +110,6 @@ async fn search(args: Args, index: Index) -> (usize, usize) {
     let vectors_uploaded = Arc::new(Mutex::new(0));
 
     let mut wg = WaitGroup::new();
-
     for entry in WalkDir::new(".").into_iter().filter_entry(|e| is_valid(e, &a.ignore, &a.fileextensions)).filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             let arg = Arc::clone(&a);
@@ -119,7 +119,7 @@ async fn search(args: Args, index: Index) -> (usize, usize) {
             files_operated_on += 1;
             tokio::spawn(async move {
                 println!("{:?}", entry.path());
-                let c = handle_file(&arg, &ind, entry.path()).await; worker.done();
+                let c = handle_file(&arg, &ind, entry.path(), entry.path()).await; worker.done();
                 let mut lock = mutex.lock().await;
                 *lock += c;
             });
@@ -130,7 +130,7 @@ async fn search(args: Args, index: Index) -> (usize, usize) {
     x
 }
 
-async fn handle_file(args: &Args, index: &Index, path: impl AsRef<Path>) -> usize {
+async fn handle_file(args: &Args, index: &Index, path: impl AsRef<Path>, path2: impl AsRef<Path>) -> usize {
     let split_err = match args.delimiter {
         Some(_) => split_file_by_delimiter(args, path),
         None => split_file_by_length(args, path)
@@ -143,11 +143,19 @@ async fn handle_file(args: &Args, index: &Index, path: impl AsRef<Path>) -> usiz
         }
     };
 
+    let pb = ProgressBar::new(split.len() as u64);
     let mut count =  0;
+    pb.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {vec_count}/{total_vectors} ({eta})")
+            .unwrap()
+    //        .with_key("", |state: &ProgressState, w: &mut dyn Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
+            .progress_chars("#>-"));
     for content in split.chunks(VECTORS_PER_UPSERT) {
         let mut vecs: Vec<Vector> = Vec::with_capacity(content.len());
         for group in content {
             count += 1;
+
+            pb.inc(1);
+
             vecs.push(Vector{
                 id: Uuid::new_v4().to_string(),
                 values: vec![0.0;1536], //TODO: Implement the OpenAI Embeddings API
@@ -161,6 +169,7 @@ async fn handle_file(args: &Args, index: &Index, path: impl AsRef<Path>) -> usiz
             eprintln!("Failed to upload to index: {:?}", e);
         }
     }
+    pb.finish_and_clear();
     count
 }
 
