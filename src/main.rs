@@ -3,6 +3,7 @@ use std::{env, path::Path, sync::Arc, process, fs::{self, File}, collections::BT
 /// pinepass fill 
 
 use clap::Parser;
+use tokio::sync::Mutex;
 use walkdir::{WalkDir, DirEntry};
 use pinenut::{models::{Vector, MappedValue}, Client, Index};
 use uuid::Uuid;
@@ -64,10 +65,15 @@ async fn main() {
     args.environment = Some(args.environment.clone().unwrap_or(env::var(ENVIRONMENT_ENV).unwrap()));
     args.index = Some(args.index.clone().unwrap_or(env::var(INDEX_NAME_ENV).unwrap()));
 
+    if args.fileextensions.is_empty() {
+        eprintln!("Please select atleast one file extension to search for");
+        process::exit(1);
+    }
     // We create an instance of client first and firstmost. Panics if it couldn't authenticate.
     let client = Client::new(args.key.clone().unwrap(), args.environment.clone().unwrap())
         .await
         .unwrap();
+
 
     // creates an index, will not authenticate.
     let mut index = client.index(args.index.clone().unwrap());
@@ -77,42 +83,54 @@ async fn main() {
         process::exit(1);
     }
 
-    search(args, index).await;
+    let (file_count, vector_count) = search(args, index).await;
+    eprintln!("Pinepass Success! {} files and {} vectors handeled and upserted", file_count, vector_count);
+
 }
 
 fn is_valid(entry: &DirEntry, ignore: &Option<Vec<String>>, extensions: &[String]) -> bool {
+    let dir = entry.path().to_str().unwrap();
     if let Some(ignore_paths) = ignore {
-        let dir = entry.path().to_str().unwrap();
         if entry.path().is_dir() && ignore_paths.iter().any(|e| dir.starts_with(e)) {
             return false;
         }
-        if !entry.path().is_dir() && extensions.iter().any(|e| !dir.ends_with(e)) {
-            return false;
-        }
+    }
+    if !entry.path().is_dir() && extensions.iter().any(|e| !dir.ends_with(e)) {
+        return false;
     }
     true
 }
 
-async fn search(args: Args, index: Index){
+async fn search(args: Args, index: Index) -> (usize, usize) {
     let a = Arc::new(args);
     let i = Arc::new(index);
+
+    let mut files_operated_on: usize = 0;
+    let vectors_uploaded = Arc::new(Mutex::new(0));
+
     let mut wg = WaitGroup::new();
+
     for entry in WalkDir::new(".").into_iter().filter_entry(|e| is_valid(e, &a.ignore, &a.fileextensions)).filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             let arg = Arc::clone(&a);
             let ind = Arc::clone(&i);
+            let mutex = Arc::clone(&vectors_uploaded);
             let worker = wg.worker();
+            files_operated_on += 1;
             tokio::spawn(async move {
-                handle_file(&arg, &ind, entry.path()).await;
-                worker.done();
+                println!("{:?}", entry.path());
+                let c = handle_file(&arg, &ind, entry.path()).await; worker.done();
+                let mut lock = mutex.lock().await;
+                *lock += c;
             });
         }
     }
     wg.wait().await;
-    println!("Testing");
+    let x = (files_operated_on, vectors_uploaded.lock().await.to_owned());
+    x
 }
 
-async fn handle_file(args: &Args, index: &Index, path: impl AsRef<Path>){
+async fn handle_file(args: &Args, index: &Index, path: impl AsRef<Path>) -> usize {
     let split_err = match args.delimiter {
         Some(_) => split_file_by_delimiter(args, path),
         None => split_file_by_length(args, path)
@@ -121,13 +139,15 @@ async fn handle_file(args: &Args, index: &Index, path: impl AsRef<Path>){
     let split = match split_err {
         Ok(v) => v,
         Err(_) => {
-            return
+            return 0
         }
-    } ;
+    };
 
+    let mut count =  0;
     for content in split.chunks(VECTORS_PER_UPSERT) {
         let mut vecs: Vec<Vector> = Vec::with_capacity(content.len());
         for group in content {
+            count += 1;
             vecs.push(Vector{
                 id: Uuid::new_v4().to_string(),
                 values: vec![0.0;1536], //TODO: Implement the OpenAI Embeddings API
@@ -141,6 +161,7 @@ async fn handle_file(args: &Args, index: &Index, path: impl AsRef<Path>){
             eprintln!("Failed to upload to index: {:?}", e);
         }
     }
+    count
 }
 
 fn split_file_by_length(args: &Args, path: impl AsRef<Path>) -> Result<Vec<String>, ()> {
@@ -155,13 +176,14 @@ fn split_file_by_length(args: &Args, path: impl AsRef<Path>) -> Result<Vec<Strin
     let mut buf = vec![0u8; args.length * 4];
     loop {
         let bytes = reader.read(&mut buf);
-        vec.push(std::str::from_utf8(&buf).unwrap().to_string());
+        vec.push(String::from_utf8_lossy(&buf).to_string());
         if let Ok(read_bytes) = bytes {
             if read_bytes != 4 * args.length {
                 break;
             }
         }
     }
+    println!("{:?}", vec);
     Ok(vec)
 }
 

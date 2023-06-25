@@ -6,6 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+indicatif="0.17.5"
 clap = { version = "4.3.8", features = ["derive"] }
 pinenut = "0.1.2"
 walkdir = "2"
