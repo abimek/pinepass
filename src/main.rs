@@ -1,9 +1,19 @@
-use std::{env, path::Path, sync::Arc, process, fs::{self, File}, collections::BTreeMap, io::{BufReader, BufRead, Read, Write}};
+/// Pinepass is a command line utility meant to assist in upserting embeddings to pinecone db. It
+/// comes with two options for length based or charachter based delimination. It will read
+/// information from you're environment variables if not passed for configuration of pinecone and
+/// openai.
+///
+/// This is a part of an overarching project to make it easier to upload Obsidian MD data to
+/// pinecone and utelize it in openai. More option will be comeing such as deleteing everything
+/// within the specific namespace before uploading. I plan on making a website that allows you to
+/// easily connect OpenAI with pinecone and use it in you're searchers.
+
+use std::{env, path::Path, sync::Arc, process, fs::{self, File}, io::{BufReader, Read}};
 
 /// pinepass fill 
 
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle, ProgressState};
+use indicatif::{ProgressBar, ProgressStyle};
 use tokio::sync::Mutex;
 use walkdir::{WalkDir, DirEntry};
 use pinenut::{models::{Vector, MappedValue}, Client, Index};
