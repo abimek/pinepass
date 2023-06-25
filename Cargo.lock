@@ -628,6 +628,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd8b5dd2ae5ed71462c540258bedcb51965123ad7e7ccf4b9a8cafaa4a63576d"
 
 [[package]]
+name = "openai-api-rs"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02a26ca9103a901f042476cb0290527b6eab4268ad97e95031f4478f31f55d07"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "openssl"
 version = "0.10.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -733,6 +745,7 @@ dependencies = [
  "awaitgroup",
  "clap",
  "indicatif",
+ "openai-api-rs",
  "pinenut",
  "serde_json",
  "tokio",

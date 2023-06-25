@@ -8,13 +8,14 @@
 /// within the specific namespace before uploading. I plan on making a website that allows you to
 /// easily connect OpenAI with pinecone and use it in you're searchers.
 
-use std::{env, path::Path, sync::Arc, process, fs::{self, File}, io::{BufReader, Read}};
+use std::{env, path::Path, sync::Arc, process, fs::{self, File}, io::{BufReader, Read}, time::Duration};
 
 /// pinepass fill 
 
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use tokio::sync::Mutex;
+use openai_api_rs::v1::{api::Client as OClient, embedding::EmbeddingRequest};
+use tokio::sync::{Mutex, mpsc};
 use walkdir::{WalkDir, DirEntry};
 use pinenut::{models::{Vector, MappedValue}, Client, Index};
 use uuid::Uuid;
@@ -33,6 +34,10 @@ struct Args {
     /// Sets the pinecone index name, if not set it will read from env var "INDEX_NAME_ENV"
     #[arg(short, long)]
     index: Option<String>,
+
+    /// Sets the openai api key for getting embeddings
+    #[arg(short, long)]
+    openaikey: Option<String>,
 
     /// namespace is the pinecone namespace to insert the value into
     #[arg(short, long, default_value="")]
@@ -61,6 +66,9 @@ struct Args {
 const API_KEY_ENV: &str = "PINECONE_API_KEY";
 const ENVIRONMENT_ENV: &str ="PINECONE_ENV";
 const INDEX_NAME_ENV: &str = "PINECONE_INDEX_NAME";
+const OPENAI_KEY_ENV: &str = "OPENAI_API_KEY";
+const OPENAI_REQUESTS_PER_MINUTE: f64 = 3000.0;
+
 
 /// This is the recommended number of vectors that should be in a single upsert (according to
 /// pinecone).
@@ -75,6 +83,7 @@ async fn main() {
     args.key = Some(args.key.clone().unwrap_or(env::var(API_KEY_ENV).unwrap()));
     args.environment = Some(args.environment.clone().unwrap_or(env::var(ENVIRONMENT_ENV).unwrap()));
     args.index = Some(args.index.clone().unwrap_or(env::var(INDEX_NAME_ENV).unwrap()));
+    args.openaikey = Some(args.openaikey.clone().unwrap_or(env::var(OPENAI_KEY_ENV).unwrap()));
 
     if args.fileextensions.is_empty() {
         eprintln!("Please select atleast one file extension to search for");
@@ -94,8 +103,7 @@ async fn main() {
         process::exit(1);
     }
 
-    let (file_count, vector_count) = search(args, index).await;
-    eprintln!("Pinepass Success! {} files and {} vectors handeled and upserted", file_count, vector_count);
+    search(args, index).await;
 
 }
 
@@ -112,75 +120,114 @@ fn is_valid(entry: &DirEntry, ignore: &Option<Vec<String>>, extensions: &[String
     true
 }
 
-async fn search(args: Args, index: Index) -> (usize, usize) {
+async fn search(args: Args, index: Index) {
     let a = Arc::new(args);
     let i = Arc::new(index);
 
-    let mut files_operated_on: usize = 0;
-    let vectors_uploaded = Arc::new(Mutex::new(0));
 
     let mut wg = WaitGroup::new();
+    let upserts: Arc<Mutex<Vec<Vec<Vector>>>> = Arc::new(Mutex::new(Vec::new()));
+    let v: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let (txs, mut rxs) = mpsc::channel(1);
+    let (txv, mut rxv) = mpsc::channel(1);
     for entry in WalkDir::new(".").into_iter().filter_entry(|e| is_valid(e, &a.ignore, &a.fileextensions)).filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             let arg = Arc::clone(&a);
-            let ind = Arc::clone(&i);
-            let mutex = Arc::clone(&vectors_uploaded);
             let worker = wg.worker();
-            files_operated_on += 1;
+            let my_v = Arc::clone(&v);
+            let tx2 = txs.clone();
             tokio::spawn(async move {
                 println!("{:?}", entry.path());
-                let c = handle_file(&arg, &ind, entry.path(), entry.path()).await; worker.done();
-                let mut lock = mutex.lock().await;
-                *lock += c;
+                let mut p_vecs = process_file(&arg, entry.path()).await; 
+                if let Some(ref mut vecs) = p_vecs {
+                    my_v.lock().await.append(vecs);
+                    let _ = tx2.send(1).await;
+                }
+                worker.done();
             });
         }
     }
+    drop(txs);
+
+    let u = Arc::clone(&upserts);
+    let worker = wg.worker();
+    let arg = Arc::clone(&a);
+    tokio::spawn(async move {
+        let client = OClient::new(arg.openaikey.clone().unwrap());
+        let tx2v = txv.clone();
+        while rxs.recv().await.is_some() {
+            let split: Vec<String>;
+            {
+                let mut lock = v.lock().await;
+                split = lock.clone();
+                *lock = Vec::new();
+            }
+
+            let mut vector_groups: Vec<Vec<Vector>> = Vec::new();
+            for content in split.chunks(VECTORS_PER_UPSERT) {
+                let mut vecs: Vec<Vector> = Vec::with_capacity(content.len());
+                for group in content {
+                    let req = EmbeddingRequest{
+                        model: "text-embedding-ada-002".to_string(),
+                        input: group.to_string(),
+                        user: None
+                    };
+                    if let Ok(p_emb) = client.embedding(req).await {
+                        if let Some(emb) = p_emb.data.get(0) {
+                            vecs.push(Vector{
+                                id: Uuid::new_v4().to_string(),
+                                values: emb.embedding.clone(), 
+                                sparse_values: None,
+                                metadata: Some(
+                                    MappedValue::from([(METADATA_KEY.to_string(), serde_json::Value::String(group.to_string()))])
+                                )
+                            });
+                        } else {
+                            continue;
+                        }
+                    }
+                }
+                vector_groups.push(vecs);
+                tokio::time::sleep(Duration::from_nanos(((1000000000.0)/OPENAI_REQUESTS_PER_MINUTE).round() as u64)).await;
+            }
+            u.lock().await.append(&mut vector_groups);
+            let _ = tx2v.send(1).await;
+        }
+        worker.done();
+    });
+
+    while rxv.recv().await.is_some() {
+        let arg = Arc::clone(&a);
+        let ups: Vec<Vec<Vector>>;
+        {
+            let mut lock = upserts.lock().await;
+            ups = lock.clone();
+            *lock = Vec::new();
+        }
+        let index = Arc::clone(&i);
+        let worker2 = wg.worker();
+        tokio::spawn(async move {
+            for vec_list in ups {
+                if let Err(e) = index.upsert(arg.namespace.clone(), vec_list).await {
+                    eprintln!("Failed to upload to index: {:?}", e);
+                }
+            }
+            worker2.done();
+        });
+    }
     wg.wait().await;
-    let x = (files_operated_on, vectors_uploaded.lock().await.to_owned());
-    x
 }
 
-async fn handle_file(args: &Args, index: &Index, path: impl AsRef<Path>, path2: impl AsRef<Path>) -> usize {
+async fn process_file(args: &Args, path: impl AsRef<Path>) -> Option<Vec<String>> {
     let split_err = match args.delimiter {
         Some(_) => split_file_by_delimiter(args, path),
         None => split_file_by_length(args, path)
     };
 
-    let split = match split_err {
-        Ok(v) => v,
-        Err(_) => {
-            return 0
-        }
-    };
-
-    let pb = ProgressBar::new(split.len() as u64);
-    let mut count =  0;
-    pb.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {vec_count}/{total_vectors} ({eta})")
-            .unwrap()
-    //        .with_key("", |state: &ProgressState, w: &mut dyn Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
-            .progress_chars("#>-"));
-    for content in split.chunks(VECTORS_PER_UPSERT) {
-        let mut vecs: Vec<Vector> = Vec::with_capacity(content.len());
-        for group in content {
-            count += 1;
-
-            pb.inc(1);
-
-            vecs.push(Vector{
-                id: Uuid::new_v4().to_string(),
-                values: vec![0.0;1536], //TODO: Implement the OpenAI Embeddings API
-                sparse_values: None,
-                metadata: Some(
-                    MappedValue::from([(METADATA_KEY.to_string(), serde_json::Value::String(group.to_string()))])
-                )
-            });
-        }
-        if let Err(e) = index.upsert(args.namespace.clone(), vecs.clone()).await {
-            eprintln!("Failed to upload to index: {:?}", e);
-        }
+    match split_err {
+        Ok(v) => Some(v),
+        Err(_) => None
     }
-    pb.finish_and_clear();
-    count
 }
 
 fn split_file_by_length(args: &Args, path: impl AsRef<Path>) -> Result<Vec<String>, ()> {
@@ -202,7 +249,6 @@ fn split_file_by_length(args: &Args, path: impl AsRef<Path>) -> Result<Vec<Strin
             }
         }
     }
-    println!("{:?}", vec);
     Ok(vec)
 }
 
