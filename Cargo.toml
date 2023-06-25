@@ -1,0 +1,21 @@
+[package]
+name = "pinepass"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = { version = "4.3.8", features = ["derive"] }
+pinenut = "0.1.2"
+walkdir = "2"
+tokio = { version = "1.28.2", features = ["full"]}
+serde_json = {version="1.0", features = ["preserve_order"]}
+awaitgroup = "0.6.0"
+
+[dependencies.uuid]
+version = "1.3.4"
+features = [
+  "v4",
+  "fast-rng"
+]
