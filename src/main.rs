@@ -141,6 +141,7 @@ async fn search(args: Args, index: Index) -> usize {
                 if let Some(ref mut vecs) = p_vecs {
                     my_v.lock().await.append(vecs);
                     let _ = tx2.send(1).await;
+//                    println!("{:?}", entry.path());
                 }
                 worker.done();
             });
@@ -159,7 +160,14 @@ async fn search(args: Args, index: Index) -> usize {
                 split = lock.clone();
                 *lock = Vec::new();
             }
+            if split.is_empty() {
+                continue;
+            }
             for content in split.chunks(VECTORS_PER_UPSERT) {
+                let pb = Arc::new(Mutex::new(ProgressBar::new(split.len() as u64)));
+                pb.lock().await.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} ({eta})")
+                            .unwrap()
+                            .progress_chars("#>-"));
                 let vecs: Arc<Mutex<Vec<Vector>>> = Arc::new(Mutex::new(Vec::with_capacity(content.len())));
                 let mut wg2 = WaitGroup::new();
                 for group in content {
@@ -167,6 +175,8 @@ async fn search(args: Args, index: Index) -> usize {
                     let work2 = wg2.worker();
                     let ve = Arc::clone(&vecs);
                     let key = arg.openaikey.clone();
+                    let p = Arc::clone(&pb);
+                  //  println!("{}", i);
                     tokio::spawn(async move {
                         let client = OClient::new(key.unwrap());
                         let req = EmbeddingRequest{
@@ -187,11 +197,14 @@ async fn search(args: Args, index: Index) -> usize {
                                 });
                             } 
                         }
+                        p.lock().await.inc(1);
                         work2.done()
                     });
-                    tokio::time::sleep(Duration::from_nanos(((1000000000.0)/OPENAI_REQUESTS_PER_MINUTE).round() as u64)).await;
+                    tokio::time::sleep(Duration::from_nanos(((10000000.0)/OPENAI_REQUESTS_PER_MINUTE).round() as u64)).await;
                 }
                 wg2.wait().await;
+               // println!("clean {}", i);
+                pb.lock().await.finish_and_clear();
                 let mut lock = vecs.lock().await;
                 u.lock().await.push((&mut lock).to_vec());
                 let _ = txv.send(1).await;
