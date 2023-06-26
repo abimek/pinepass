@@ -72,7 +72,7 @@ const OPENAI_REQUESTS_PER_MINUTE: f64 = 3000.0;
 
 /// This is the recommended number of vectors that should be in a single upsert (according to
 /// pinecone).
-const VECTORS_PER_UPSERT: usize = 1000;
+const VECTORS_PER_UPSERT: usize = 100;
 
 const METADATA_KEY: &str = "content";
 
@@ -103,8 +103,8 @@ async fn main() {
         process::exit(1);
     }
 
-    search(args, index).await;
-
+    let v = search(args, index).await;
+    println!("{} vectors upserted", v);
 }
 
 fn is_valid(entry: &DirEntry, ignore: &Option<Vec<String>>, extensions: &[String]) -> bool {
@@ -120,7 +120,7 @@ fn is_valid(entry: &DirEntry, ignore: &Option<Vec<String>>, extensions: &[String
     true
 }
 
-async fn search(args: Args, index: Index) {
+async fn search(args: Args, index: Index) -> usize {
     let a = Arc::new(args);
     let i = Arc::new(index);
 
@@ -137,7 +137,6 @@ async fn search(args: Args, index: Index) {
             let my_v = Arc::clone(&v);
             let tx2 = txs.clone();
             tokio::spawn(async move {
-                println!("{:?}", entry.path());
                 let mut p_vecs = process_file(&arg, entry.path()).await; 
                 if let Some(ref mut vecs) = p_vecs {
                     my_v.lock().await.append(vecs);
@@ -153,8 +152,6 @@ async fn search(args: Args, index: Index) {
     let worker = wg.worker();
     let arg = Arc::clone(&a);
     tokio::spawn(async move {
-        let client = OClient::new(arg.openaikey.clone().unwrap());
-        let tx2v = txv.clone();
         while rxs.recv().await.is_some() {
             let split: Vec<String>;
             {
@@ -162,40 +159,48 @@ async fn search(args: Args, index: Index) {
                 split = lock.clone();
                 *lock = Vec::new();
             }
-
-            let mut vector_groups: Vec<Vec<Vector>> = Vec::new();
             for content in split.chunks(VECTORS_PER_UPSERT) {
-                let mut vecs: Vec<Vector> = Vec::with_capacity(content.len());
+                let vecs: Arc<Mutex<Vec<Vector>>> = Arc::new(Mutex::new(Vec::with_capacity(content.len())));
+                let mut wg2 = WaitGroup::new();
                 for group in content {
-                    let req = EmbeddingRequest{
-                        model: "text-embedding-ada-002".to_string(),
-                        input: group.to_string(),
-                        user: None
-                    };
-                    if let Ok(p_emb) = client.embedding(req).await {
-                        if let Some(emb) = p_emb.data.get(0) {
-                            vecs.push(Vector{
-                                id: Uuid::new_v4().to_string(),
-                                values: emb.embedding.clone(), 
-                                sparse_values: None,
-                                metadata: Some(
-                                    MappedValue::from([(METADATA_KEY.to_string(), serde_json::Value::String(group.to_string()))])
-                                )
-                            });
-                        } else {
-                            continue;
+                    let g = group.clone();
+                    let work2 = wg2.worker();
+                    let ve = Arc::clone(&vecs);
+                    let key = arg.openaikey.clone();
+                    tokio::spawn(async move {
+                        let client = OClient::new(key.unwrap());
+                        let req = EmbeddingRequest{
+                            model: "text-embedding-ada-002".to_string(),
+                            input: g.to_string(),
+                            user: None
+                        };
+                        if let Ok(p_emb) = client.embedding(req).await {
+                            if let Some(emb) = p_emb.data.get(0) {
+                                let mut lock = ve.lock().await;
+                                lock.push(Vector{
+                                    id: Uuid::new_v4().to_string(),
+                                    values: emb.embedding.clone(), 
+                                    sparse_values: None,
+                                    metadata: Some(
+                                        MappedValue::from([(METADATA_KEY.to_string(), serde_json::Value::String(g.to_string()))])
+                                    )
+                                });
+                            } 
                         }
-                    }
+                        work2.done()
+                    });
+                    tokio::time::sleep(Duration::from_nanos(((1000000000.0)/OPENAI_REQUESTS_PER_MINUTE).round() as u64)).await;
                 }
-                vector_groups.push(vecs);
-                tokio::time::sleep(Duration::from_nanos(((1000000000.0)/OPENAI_REQUESTS_PER_MINUTE).round() as u64)).await;
+                wg2.wait().await;
+                let mut lock = vecs.lock().await;
+                u.lock().await.push((&mut lock).to_vec());
+                let _ = txv.send(1).await;
             }
-            u.lock().await.append(&mut vector_groups);
-            let _ = tx2v.send(1).await;
         }
         worker.done();
     });
 
+    let mut vec_count = 0;
     while rxv.recv().await.is_some() {
         let arg = Arc::clone(&a);
         let ups: Vec<Vec<Vector>>;
@@ -203,6 +208,9 @@ async fn search(args: Args, index: Index) {
             let mut lock = upserts.lock().await;
             ups = lock.clone();
             *lock = Vec::new();
+        }
+        for x in ups.iter() {
+            vec_count += x.len()
         }
         let index = Arc::clone(&i);
         let worker2 = wg.worker();
@@ -216,6 +224,7 @@ async fn search(args: Args, index: Index) {
         });
     }
     wg.wait().await;
+    vec_count
 }
 
 async fn process_file(args: &Args, path: impl AsRef<Path>) -> Option<Vec<String>> {
