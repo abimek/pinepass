@@ -10,8 +10,6 @@
 
 use std::{env, path::Path, sync::Arc, process, fs::{self, File}, io::{BufReader, Read}, time::Duration};
 
-/// pinepass fill 
-
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use openai_api_rs::v1::{api::Client as OClient, embedding::EmbeddingRequest};
@@ -125,6 +123,10 @@ async fn search(args: Args, index: Index) -> usize {
     let i = Arc::new(index);
 
 
+    // This asynchronously and recursivly gets the text for the data within the directory
+    // that the utility is ran in. It then uploads it to a channel to notify the embedding process
+    // to run.
+    
     let mut wg = WaitGroup::new();
     let upserts: Arc<Mutex<Vec<Vec<Vector>>>> = Arc::new(Mutex::new(Vec::new()));
     let v: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -147,11 +149,17 @@ async fn search(args: Args, index: Index) -> usize {
             });
         }
     }
-    drop(txs);
 
+
+    drop(txs);
     let u = Arc::clone(&upserts);
     let worker = wg.worker();
     let arg = Arc::clone(&a);
+
+    // This runs thorugh every vector recieved asynchronously and gets it's embedding. This is done
+    // in a singular task in order synchronize the timing between requests as to not exceed the
+    // openai api limit. This then send the embeddings through a channel to be used for pinecone
+    // uploads.
     tokio::spawn(async move {
         while rxs.recv().await.is_some() {
             let split: Vec<String>;
@@ -213,6 +221,7 @@ async fn search(args: Args, index: Index) -> usize {
         worker.done();
     });
 
+    // Reads the embedding and uploads it to pinecone, it waits until all of them are finished.
     let mut vec_count = 0;
     while rxv.recv().await.is_some() {
         let arg = Arc::clone(&a);
