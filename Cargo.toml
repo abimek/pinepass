@@ -8,11 +8,12 @@ edition = "2021"
 [dependencies]
 openai-api-rs = "0.1.8"
 indicatif="0.17.5"
-clap = { version = "4.3.8", features = ["derive"] }
+clap = { version = "3", features = ["derive"] }
 pinenut = "0.1.2"
 walkdir = "2"
 tokio = { version = "1.28.2", features = ["full"]}
 serde_json = {version="1.0", features = ["preserve_order"]}
+klask = "1.0.0"
 awaitgroup = "0.6.0"
 
 [dependencies.uuid]

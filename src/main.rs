@@ -7,54 +7,59 @@
 /// pinecone and utelize it in openai. More option will be comeing such as deleteing everything
 /// within the specific namespace before uploading. I plan on making a website that allows you to
 /// easily connect OpenAI with pinecone and use it in you're searchers.
+///
 
 use std::{env, path::Path, sync::Arc, process, fs::{self, File}, io::{BufReader, Read}, time::Duration};
 
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
+use klask::Settings;
+use std::sync::mpsc::{Sender, Receiver};
+use std::sync::mpsc as chan;
 use openai_api_rs::v1::{api::Client as OClient, embedding::EmbeddingRequest};
 use tokio::sync::{Mutex, mpsc};
 use walkdir::{WalkDir, DirEntry};
 use pinenut::{models::{Vector, MappedValue}, Client, Index};
 use uuid::Uuid;
 use awaitgroup::WaitGroup;
+use std::{thread, time};
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[clap(author, version, about, long_about = None)]
 struct Args {
     /// Sets the pinecone api key, if not set it will read from env var "PINECONE_API_KEY"
-    #[arg(short, long)]
+    #[clap(short, long)]
     key: Option<String>,
 
     /// Sets the pinecone environment, if not set it will read from env var "PINECONE_ENV"
-    #[arg(short, long)]
+    #[clap(short, long)]
     environment: Option<String>,
 
     /// Sets the pinecone index name, if not set it will read from env var "INDEX_NAME_ENV"
-    #[arg(short, long)]
+    #[clap(short, long)]
     index: Option<String>,
 
     /// Sets the openai api key for getting embeddings
-    #[arg(short, long)]
+    #[clap(short, long)]
     openaikey: Option<String>,
 
     /// namespace is the pinecone namespace to insert the value into
-    #[arg(short, long, default_value="")]
+    #[clap(short, long, default_value="")]
     namespace: String,
 
     /// String to delimiter string, when given a value length based delimination is not used
-    #[arg(short, long)]
+    #[clap(short, long)]
     delimiter: Option<String>,
 
     /// Sets the length delimiter value, this default to character  
-    #[arg(short, long, default_value_t=100)]
+    #[clap(short, long, default_value_t=100)]
     length: usize,
 
     /// file extensions to search for, examples are "md" or "txt", don't include the period
-    #[arg(short, long)]
+    #[clap(short, long)]
     fileextensions: Vec<String>,
 
     /// Directories or files to ignore during the scan
-    #[arg(long)]
+    #[clap(long)]
     ignore: Option<Vec<String>>,
 
 }
@@ -73,36 +78,40 @@ const OPENAI_REQUESTS_PER_MINUTE: f64 = 3000.0;
 const VECTORS_PER_UPSERT: usize = 100;
 
 const METADATA_KEY: &str = "content";
-
 #[tokio::main]
 async fn main() {
-    let mut args = Args::parse();
-    
-    args.key = Some(args.key.clone().unwrap_or(env::var(API_KEY_ENV).unwrap()));
-    args.environment = Some(args.environment.clone().unwrap_or(env::var(ENVIRONMENT_ENV).unwrap()));
-    args.index = Some(args.index.clone().unwrap_or(env::var(INDEX_NAME_ENV).unwrap()));
-    args.openaikey = Some(args.openaikey.clone().unwrap_or(env::var(OPENAI_KEY_ENV).unwrap()));
 
-    if args.fileextensions.is_empty() {
-        eprintln!("Please select atleast one file extension to search for");
-        process::exit(1);
-    }
-    // We create an instance of client first and firstmost. Panics if it couldn't authenticate.
-    let client = Client::new(args.key.clone().unwrap(), args.environment.clone().unwrap())
-        .await
-        .unwrap();
+    klask::run_derived::<Args, _>(Settings::default(), |mut args| {
+        println!("{}", args.key.clone().unwrap());
+        args.key = Some(args.key.clone().unwrap_or_else(|| env::var(API_KEY_ENV).unwrap()));
+        args.environment = Some(args.environment.clone().unwrap_or_else(|| env::var(ENVIRONMENT_ENV).unwrap()));
+        args.index = Some(args.index.clone().unwrap_or_else(|| env::var(INDEX_NAME_ENV).unwrap()));
+        args.openaikey = Some(args.openaikey.clone().unwrap_or_else(|| env::var(OPENAI_KEY_ENV).unwrap()));
 
+        if args.fileextensions.is_empty() {
+            eprintln!("Please select atleast one file extension to search for");
+            process::exit(1);
+        }
+        let (tx, rx): (Sender<i32>, Receiver<i32>) = chan::channel();
+        tokio::spawn(async move {
+            // We create an instance of client first and firstmost. Panics if it couldn't authenticate.
+            let client = Client::new(args.key.clone().unwrap(), args.environment.clone().unwrap())
+                .await
+                .unwrap();
 
-    // creates an index, will not authenticate.
-    let mut index = client.index(args.index.clone().unwrap());
+            // creates an index, will not authenticate.
+            let mut index = client.index(args.index.clone().unwrap());
+            if let Err(e) = index.describe().await {
+                eprintln!("Invalid Pinecone Credentials: {:?}", e);
+                process::exit(1);
+            }
 
-    if let Err(e) = index.describe().await {
-        eprintln!("Invalid Pinecone Credentials: {:?}", e);
-        process::exit(1);
-    }
-
-    let v = search(args, index).await;
-    println!("{} vectors upserted", v);
+            let v = search(args, index).await;
+            println!("{} vectors upserted", v);
+            tx.send(1).unwrap();
+        });
+        let _ = rx.recv();
+    });
 }
 
 fn is_valid(entry: &DirEntry, ignore: &Option<Vec<String>>, extensions: &[String]) -> bool {
@@ -130,8 +139,8 @@ async fn search(args: Args, index: Index) -> usize {
     let mut wg = WaitGroup::new();
     let upserts: Arc<Mutex<Vec<Vec<Vector>>>> = Arc::new(Mutex::new(Vec::new()));
     let v: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let (txs, mut rxs) = mpsc::channel(1);
-    let (txv, mut rxv) = mpsc::channel(1);
+    let (txs, mut rxs) = mpsc::channel(100);
+    let (txv, mut rxv) = mpsc::channel(100);
     for entry in WalkDir::new(".").into_iter().filter_entry(|e| is_valid(e, &a.ignore, &a.fileextensions)).filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             let arg = Arc::clone(&a);
