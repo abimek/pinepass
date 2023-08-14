@@ -11,11 +11,12 @@
 
 use std::{env, path::Path, sync::Arc, process, fs::{self, File}, io::{BufReader, Read}, time::Duration};
 
-use clap::Parser;
+use clap::{Parser, ValueHint};
 use indicatif::{ProgressBar, ProgressStyle};
 use klask::Settings;
 use std::sync::mpsc::{Sender, Receiver};
 use std::sync::mpsc as chan;
+use std::path::PathBuf;
 use openai_api_rs::v1::{api::Client as OClient, embedding::EmbeddingRequest};
 use tokio::sync::{Mutex, mpsc};
 use walkdir::{WalkDir, DirEntry};
@@ -26,21 +27,12 @@ use std::{thread, time};
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    /// Sets the pinecone api key, if not set it will read from env var "PINECONE_API_KEY"
+    #[clap(long, parse(from_os_str), value_hint = ValueHint::AnyPath)]
+    dir: Option<PathBuf>,
+
+    /// The Generated Token From OpenNote
     #[clap(short, long)]
     key: Option<String>,
-
-    /// Sets the pinecone environment, if not set it will read from env var "PINECONE_ENV"
-    #[clap(short, long)]
-    environment: Option<String>,
-
-    /// Sets the pinecone index name, if not set it will read from env var "INDEX_NAME_ENV"
-    #[clap(short, long)]
-    index: Option<String>,
-
-    /// Sets the openai api key for getting embeddings
-    #[clap(short, long)]
-    openaikey: Option<String>,
 
     /// namespace is the pinecone namespace to insert the value into
     #[clap(short, long, default_value="")]
@@ -59,9 +51,8 @@ struct Args {
     fileextensions: Vec<String>,
 
     /// Directories or files to ignore during the scan
-    #[clap(long)]
-    ignore: Option<Vec<String>>,
-
+    #[clap(long, default_values_t=[".obsidian".to_string(), ".git".to_string()])]
+    ignore: Vec<String>,
 }
 
 /// Environment variables that will be read when the values for key, environment, and index are not
@@ -83,10 +74,8 @@ async fn main() {
 
     klask::run_derived::<Args, _>(Settings::default(), |mut args| {
         println!("{}", args.key.clone().unwrap());
+        args.dir = Some(args.dir.clone().unwrap());
         args.key = Some(args.key.clone().unwrap_or_else(|| env::var(API_KEY_ENV).unwrap()));
-        args.environment = Some(args.environment.clone().unwrap_or_else(|| env::var(ENVIRONMENT_ENV).unwrap()));
-        args.index = Some(args.index.clone().unwrap_or_else(|| env::var(INDEX_NAME_ENV).unwrap()));
-        args.openaikey = Some(args.openaikey.clone().unwrap_or_else(|| env::var(OPENAI_KEY_ENV).unwrap()));
 
         if args.fileextensions.is_empty() {
             eprintln!("Please select atleast one file extension to search for");
@@ -107,6 +96,8 @@ async fn main() {
             }
 
             let v = search(args, index).await;
+            klask::output::progress_bar("Progress", 100 as f32/ 100 as f32);
+            klask::output::progress_bar("Sub-Progress", 100 as f32/ 100 as f32);
             println!("{} vectors upserted", v);
             tx.send(1).unwrap();
         });
@@ -114,12 +105,30 @@ async fn main() {
     });
 }
 
-fn is_valid(entry: &DirEntry, ignore: &Option<Vec<String>>, extensions: &[String]) -> bool {
+struct User {
+    openai_key: String,
+    pinecone_key: String,
+    pinecone_environment: String,
+    pinecone_index: String,
+    pinecone_project: String,
+    top_k: u32,
+    uid: String
+}
+
+async fn get_user(user: impl Into<String>) {
+}
+
+fn is_valid(dird: PathBuf, entry: &DirEntry, ignore: &Vec<String>, extensions: &[String]) -> bool {
     let dir = entry.path().to_str().unwrap();
-    if let Some(ignore_paths) = ignore {
-        if entry.path().is_dir() && ignore_paths.iter().any(|e| dir.starts_with(e)) {
-            return false;
-        }
+    let mut current_dir = dird;
+
+    if entry.path().is_dir() && ignore.iter().any(|e| {
+        current_dir.push(e);
+        let v = dir.starts_with(current_dir.to_str().unwrap());
+        current_dir.pop();
+        return v;
+    }) {
+        return false;
     }
     if !entry.path().is_dir() && extensions.iter().any(|e| !dir.ends_with(e)) {
         return false;
@@ -141,7 +150,7 @@ async fn search(args: Args, index: Index) -> usize {
     let v: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let (txs, mut rxs) = mpsc::channel(100);
     let (txv, mut rxv) = mpsc::channel(100);
-    for entry in WalkDir::new(".").into_iter().filter_entry(|e| is_valid(e, &a.ignore, &a.fileextensions)).filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(&a.dir.clone().unwrap()).into_iter().filter_entry(|e| is_valid(a.dir.clone().unwrap(), e, &a.ignore, &a.fileextensions)).filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             let arg = Arc::clone(&a);
             let worker = wg.worker();
@@ -180,19 +189,21 @@ async fn search(args: Args, index: Index) -> usize {
             if split.is_empty() {
                 continue;
             }
+            let c = split.chunks(VECTORS_PER_UPSERT);
+            let mut i = -1;
             for content in split.chunks(VECTORS_PER_UPSERT) {
-                let pb = Arc::new(Mutex::new(ProgressBar::new(split.len() as u64)));
-                pb.lock().await.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} ({eta})")
-                            .unwrap()
-                            .progress_chars("#>-"));
+                i +=1 ;
+                klask::output::progress_bar("Progress", i as f32 / c.len() as f32);
                 let vecs: Arc<Mutex<Vec<Vector>>> = Arc::new(Mutex::new(Vec::with_capacity(content.len())));
                 let mut wg2 = WaitGroup::new();
+                let mut g = -1;
                 for group in content {
+                    g +=1 ;
+                    klask::output::progress_bar("Sub-Progress", g as f32 / content.len() as f32);
                     let g = group.clone();
                     let work2 = wg2.worker();
                     let ve = Arc::clone(&vecs);
                     let key = arg.openaikey.clone();
-                    let p = Arc::clone(&pb);
                   //  println!("{}", i);
                     tokio::spawn(async move {
                         let client = OClient::new(key.unwrap());
@@ -214,14 +225,11 @@ async fn search(args: Args, index: Index) -> usize {
                                 });
                             } 
                         }
-                        p.lock().await.inc(1);
                         work2.done()
                     });
                     tokio::time::sleep(Duration::from_nanos(((10000000.0)/OPENAI_REQUESTS_PER_MINUTE).round() as u64)).await;
                 }
                 wg2.wait().await;
-               // println!("clean {}", i);
-                pb.lock().await.finish_and_clear();
                 let mut lock = vecs.lock().await;
                 u.lock().await.push((&mut lock).to_vec());
                 let _ = txv.send(1).await;
